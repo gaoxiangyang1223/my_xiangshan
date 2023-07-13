@@ -24,7 +24,9 @@ import xiangshan._
 import xiangshan.cache.mmu._
 import xiangshan.frontend.icache._
 import utils._
+import utility._
 import xiangshan.backend.fu.{PMPReqBundle, PMPRespBundle}
+import utility.ChiselDB
 
 trait HasInstrMMIOConst extends HasXSParameter with HasIFUConst{
   def mmioBusWidth = 64
@@ -64,8 +66,9 @@ class NewIFUIO(implicit p: Parameters) extends XSBundle {
   val toIbuffer       = Decoupled(new FetchToIBuffer)
   val uncacheInter   =  new UncacheInterface
   val frontendTrigger = Flipped(new FrontendTdataDistributeIO)
+  val csrTriggerEnable = Input(Vec(4, Bool()))
   val rob_commits = Flipped(Vec(CommitWidth, Valid(new RobCommitInfo)))
-  val iTLBInter       = new BlockTlbRequestIO
+  val iTLBInter       = new TlbRequestIO
   val pmp             =   new ICachePMPBundle
   val mmioCommitRead  = new mmioCommitRead
 }
@@ -81,6 +84,7 @@ class LastHalfInfo(implicit p: Parameters) extends XSBundle {
 class IfuToPreDecode(implicit p: Parameters) extends XSBundle {
   val data                =  if(HasCExtension) Vec(PredictWidth + 1, UInt(16.W)) else Vec(PredictWidth, UInt(32.W))
   val frontendTrigger     = new FrontendTdataDistributeIO
+  val csrTriggerEnable    = Vec(4, Bool())
   val pc                  = Vec(PredictWidth, UInt(VAddrBits.W))
 }
 
@@ -93,6 +97,24 @@ class IfuToPredChecker(implicit p: Parameters) extends XSBundle {
   val instrValid    = Vec(PredictWidth, Bool())
   val pds           = Vec(PredictWidth, new PreDecodeInfo)
   val pc            = Vec(PredictWidth, UInt(VAddrBits.W))
+}
+
+class FetchToIBufferDB extends Bundle {
+  val start_addr = UInt(39.W)
+  val instr_count = UInt(32.W)
+  val exception = Bool()
+  val is_cache_hit = Bool()
+}
+
+class IfuWbToFtqDB extends Bundle {
+  val start_addr = UInt(39.W)
+  val is_miss_pred = Bool()
+  val miss_pred_offset = UInt(32.W)
+  val checkJalFault = Bool()
+  val checkRetFault = Bool()
+  val checkTargetFault = Bool()
+  val checkNotCFIFault = Bool()
+  val checkInvalidTaken = Bool()
 }
 
 class NewIFU(implicit p: Parameters) extends XSModule
@@ -111,6 +133,74 @@ class NewIFU(implicit p: Parameters) extends XSModule
 
   def isLastInCacheline(addr: UInt): Bool = addr(blockOffBits - 1, 1) === 0.U
 
+  def numOfStage = 3
+  require(numOfStage > 1, "BPU numOfStage must be greater than 1")
+  val topdown_stages = RegInit(VecInit(Seq.fill(numOfStage)(0.U.asTypeOf(new FrontendTopDownBundle))))
+  dontTouch(topdown_stages)
+  // bubble events in IFU, only happen in stage 1
+  val icacheMissBubble = Wire(Bool())
+  val itlbMissBubble =Wire(Bool())
+
+  // only driven by clock, not valid-ready
+  topdown_stages(0) := fromFtq.req.bits.topdown_info
+  for (i <- 1 until numOfStage) {
+    topdown_stages(i) := topdown_stages(i - 1)
+  }
+  when (icacheMissBubble) {
+    topdown_stages(1).reasons(TopDownCounters.ICacheMissBubble.id) := true.B
+  }
+  when (itlbMissBubble) {
+    topdown_stages(1).reasons(TopDownCounters.ITLBMissBubble.id) := true.B
+  }
+  io.toIbuffer.bits.topdown_info := topdown_stages(numOfStage - 1)
+  when (fromFtq.topdown_redirect.valid) {
+    // only redirect from backend, IFU redirect itself is handled elsewhere
+    when (fromFtq.topdown_redirect.bits.debugIsCtrl) {
+      /*
+      for (i <- 0 until numOfStage) {
+        topdown_stages(i).reasons(TopDownCounters.ControlRedirectBubble.id) := true.B
+      }
+      io.toIbuffer.bits.topdown_info.reasons(TopDownCounters.ControlRedirectBubble.id) := true.B
+      */
+      when (fromFtq.topdown_redirect.bits.ControlBTBMissBubble) {
+        for (i <- 0 until numOfStage) {
+          topdown_stages(i).reasons(TopDownCounters.BTBMissBubble.id) := true.B
+        }
+        io.toIbuffer.bits.topdown_info.reasons(TopDownCounters.BTBMissBubble.id) := true.B
+      } .elsewhen (fromFtq.topdown_redirect.bits.TAGEMissBubble) {
+        for (i <- 0 until numOfStage) {
+          topdown_stages(i).reasons(TopDownCounters.TAGEMissBubble.id) := true.B
+        }
+        io.toIbuffer.bits.topdown_info.reasons(TopDownCounters.TAGEMissBubble.id) := true.B
+      } .elsewhen (fromFtq.topdown_redirect.bits.SCMissBubble) {
+        for (i <- 0 until numOfStage) {
+          topdown_stages(i).reasons(TopDownCounters.SCMissBubble.id) := true.B
+        }
+        io.toIbuffer.bits.topdown_info.reasons(TopDownCounters.SCMissBubble.id) := true.B
+      } .elsewhen (fromFtq.topdown_redirect.bits.ITTAGEMissBubble) {
+        for (i <- 0 until numOfStage) {
+          topdown_stages(i).reasons(TopDownCounters.ITTAGEMissBubble.id) := true.B
+        }
+        io.toIbuffer.bits.topdown_info.reasons(TopDownCounters.ITTAGEMissBubble.id) := true.B
+      } .elsewhen (fromFtq.topdown_redirect.bits.RASMissBubble) {
+        for (i <- 0 until numOfStage) {
+          topdown_stages(i).reasons(TopDownCounters.RASMissBubble.id) := true.B
+        }
+        io.toIbuffer.bits.topdown_info.reasons(TopDownCounters.RASMissBubble.id) := true.B
+      }
+    } .elsewhen (fromFtq.topdown_redirect.bits.debugIsMemVio) {
+      for (i <- 0 until numOfStage) {
+        topdown_stages(i).reasons(TopDownCounters.MemVioRedirectBubble.id) := true.B
+      }
+      io.toIbuffer.bits.topdown_info.reasons(TopDownCounters.MemVioRedirectBubble.id) := true.B
+    } .otherwise {
+      for (i <- 0 until numOfStage) {
+        topdown_stages(i).reasons(TopDownCounters.OtherRedirectBubble.id) := true.B
+      }
+      io.toIbuffer.bits.topdown_info.reasons(TopDownCounters.OtherRedirectBubble.id) := true.B
+    }
+  }
+  
   class TlbExept(implicit p: Parameters) extends XSBundle{
     val pageFault = Bool()
     val accessFault = Bool()
@@ -123,6 +213,7 @@ class NewIFU(implicit p: Parameters) extends XSModule
   val frontendTrigger = Module(new FrontendTrigger)
   val (checkerIn, checkerOutStage1, checkerOutStage2)         = (predChecker.io.in, predChecker.io.out.stage1Out,predChecker.io.out.stage2Out)
 
+  io.iTLBInter.req_kill := false.B
   io.iTLBInter.resp.ready := true.B
 
   /**
@@ -156,6 +247,16 @@ class NewIFU(implicit p: Parameters) extends XSModule
   val f1_ready, f2_ready, f3_ready         = WireInit(false.B)
 
   fromFtq.req.ready := f1_ready && io.icacheInter.icacheReady
+
+
+  when (wb_redirect) {
+    when (f3_wb_not_flush) {
+      topdown_stages(2).reasons(TopDownCounters.BTBMissBubble.id) := true.B
+    }
+    for (i <- 0 until numOfStage - 1) {
+      topdown_stages(i).reasons(TopDownCounters.BTBMissBubble.id) := true.B
+    }
+  }
 
   /** <PERF> f0 fetch bubble */
 
@@ -224,6 +325,9 @@ class NewIFU(implicit p: Parameters) extends XSModule
 
   icacheRespAllValid := f2_icache_all_resp_reg || f2_icache_all_resp_wire
 
+  icacheMissBubble := io.icacheInter.topdownIcacheMiss
+  itlbMissBubble   := io.icacheInter.topdownItlbMiss
+
   io.icacheStop := !f3_ready
 
   when(f2_flush)                                              {f2_icache_all_resp_reg := false.B}
@@ -245,11 +349,11 @@ class NewIFU(implicit p: Parameters) extends XSModule
   val f2_mmio         = fromICache(0).bits.tlbExcp.mmio && !fromICache(0).bits.tlbExcp.accessFault &&
                                                            !fromICache(0).bits.tlbExcp.pageFault
 
-  val f2_pc               = RegEnable(next = f1_pc, enable = f1_fire)
-  val f2_half_snpc        = RegEnable(next = f1_half_snpc, enable = f1_fire)
-  val f2_cut_ptr          = RegEnable(next = f1_cut_ptr, enable = f1_fire)
+  val f2_pc               = RegEnable(f1_pc,  f1_fire)
+  val f2_half_snpc        = RegEnable(f1_half_snpc,  f1_fire)
+  val f2_cut_ptr          = RegEnable(f1_cut_ptr,  f1_fire)
 
-  val f2_resend_vaddr     = RegEnable(next = f1_ftq_req.startAddr + 2.U, enable = f1_fire)
+  val f2_resend_vaddr     = RegEnable(f1_ftq_req.startAddr + 2.U,  f1_fire)
 
   def isNextLine(pc: UInt, startAddr: UInt) = {
     startAddr(blockOffBits) ^ pc(blockOffBits)
@@ -311,6 +415,7 @@ class NewIFU(implicit p: Parameters) extends XSModule
     val preDecoderIn  = preDecoders(i).io.in
     preDecoderIn.data := f2_cut_data(i)
     preDecoderIn.frontendTrigger := io.frontendTrigger  
+    preDecoderIn.csrTriggerEnable := io.csrTriggerEnable
     preDecoderIn.pc  := f2_pc
   }
 
@@ -339,18 +444,18 @@ class NewIFU(implicit p: Parameters) extends XSModule
     */
 
   val f3_valid          = RegInit(false.B)
-  val f3_ftq_req        = RegEnable(next = f2_ftq_req,    enable=f2_fire)
-  // val f3_situation      = RegEnable(next = f2_situation,  enable=f2_fire)
-  val f3_doubleLine     = RegEnable(next = f2_doubleLine, enable=f2_fire)
+  val f3_ftq_req        = RegEnable(f2_ftq_req,    f2_fire)
+  // val f3_situation      = RegEnable(f2_situation,  f2_fire)
+  val f3_doubleLine     = RegEnable(f2_doubleLine, f2_fire)
   val f3_fire           = io.toIbuffer.fire()
 
   f3_ready := f3_fire || !f3_valid
 
   val f3_cut_data       = RegEnable(next = f2_cut_data(f2_predecod_ptr), enable=f2_fire)
 
-  val f3_except_pf      = RegEnable(next = f2_except_pf, enable = f2_fire)
-  val f3_except_af      = RegEnable(next = f2_except_af, enable = f2_fire)
-  val f3_mmio           = RegEnable(next = f2_mmio   , enable = f2_fire)
+  val f3_except_pf      = RegEnable(f2_except_pf,  f2_fire)
+  val f3_except_af      = RegEnable(f2_except_af,  f2_fire)
+  val f3_mmio           = RegEnable(f2_mmio   ,  f2_fire)
 
   //val f3_expd_instr     = RegEnable(next = f2_expd_instr,  enable = f2_fire)
   val f3_instr          = RegEnable(next = f2_instr, enable = f2_fire)
@@ -365,15 +470,15 @@ class NewIFU(implicit p: Parameters) extends XSModule
   val f3_af_vec         = RegEnable(next = f2_af_vec,      enable = f2_fire)
   val f3_pf_vec         = RegEnable(next = f2_pf_vec ,     enable = f2_fire)
   val f3_pc             = RegEnable(next = f2_pc,          enable = f2_fire)
-  val f3_half_snpc        = RegEnable(next = f2_half_snpc, enable = f2_fire)
+  val f3_half_snpc      = RegEnable(next = f2_half_snpc,   enable = f2_fire)
   val f3_instr_range    = RegEnable(next = f2_instr_range, enable = f2_fire)
   val f3_foldpc         = RegEnable(next = f2_foldpc,      enable = f2_fire)
   val f3_crossPageFault = RegEnable(next = f2_crossPageFault,      enable = f2_fire)
   val f3_hasHalfValid   = RegEnable(next = f2_hasHalfValid,      enable = f2_fire)
   val f3_except         = VecInit((0 until 2).map{i => f3_except_pf(i) || f3_except_af(i)})
   val f3_has_except     = f3_valid && (f3_except_af.reduce(_||_) || f3_except_pf.reduce(_||_))
-  val f3_pAddrs   = RegEnable(next = f2_paddrs, enable = f2_fire)
-  val f3_resend_vaddr   = RegEnable(next = f2_resend_vaddr,      enable = f2_fire)
+  val f3_pAddrs   = RegEnable(f2_paddrs,  f2_fire)
+  val f3_resend_vaddr   = RegEnable(f2_resend_vaddr,       f2_fire)
 
   when(f3_valid && !f3_ftq_req.ftqOffset.valid){
     assert(f3_ftq_req.startAddr + 32.U >= f3_ftq_req.nextStartAddr , "More tha 32 Bytes fetch is not allowed!")
@@ -471,8 +576,8 @@ class NewIFU(implicit p: Parameters) extends XSModule
                      io.iTLBInter.resp.bits.excp(0).af.instr
       mmio_state :=  Mux(tlbExept,m_waitCommit,m_sendPMP)
       mmio_resend_addr := io.iTLBInter.resp.bits.paddr(0)
-      mmio_resend_af := io.iTLBInter.resp.bits.excp(0).af.instr
-      mmio_resend_pf := io.iTLBInter.resp.bits.excp(0).pf.instr
+      mmio_resend_af := mmio_resend_af || io.iTLBInter.resp.bits.excp(0).af.instr
+      mmio_resend_pf := mmio_resend_pf || io.iTLBInter.resp.bits.excp(0).pf.instr
     }
 
     is(m_sendPMP){
@@ -524,8 +629,11 @@ class NewIFU(implicit p: Parameters) extends XSModule
   io.iTLBInter.req.bits.vaddr    := f3_resend_vaddr
   io.iTLBInter.req.bits.debug.pc := f3_resend_vaddr
 
+  io.iTLBInter.req.bits.kill                := false.B // IFU use itlb for mmio, doesn't need sync, set it to false
   io.iTLBInter.req.bits.cmd                 := TlbCmd.exec
-  io.iTLBInter.req.bits.robIdx              := DontCare
+  io.iTLBInter.req.bits.memidx              := DontCare
+  io.iTLBInter.req.bits.debug.robIdx        := DontCare
+  io.iTLBInter.req.bits.no_translate        := false.B
   io.iTLBInter.req.bits.debug.isFirstIssue  := DontCare
 
   io.pmp.req.valid := (mmio_state === m_sendPMP) && f3_req_is_mmio
@@ -555,7 +663,7 @@ class NewIFU(implicit p: Parameters) extends XSModule
     !f3_pd(idx).isRVC && checkerOutStage1.fixedRange(idx) && f3_instr_valid(idx) && !checkerOutStage1.fixedTaken(idx) && ! f3_req_is_mmio
   }
 
-  val f3_last_validIdx             = ~ParallelPriorityEncoder(checkerOutStage1.fixedRange.reverse)
+  val f3_last_validIdx       = ParallelPosteriorityEncoder(checkerOutStage1.fixedRange)
 
   val f3_hasLastHalf         = hasLastHalf((PredictWidth - 1).U)
   val f3_false_lastHalf      = hasLastHalf(f3_last_validIdx)
@@ -583,6 +691,7 @@ class NewIFU(implicit p: Parameters) extends XSModule
   frontendTrigger.io.data   := f3_cut_data
 
   frontendTrigger.io.frontendTrigger  := io.frontendTrigger
+  frontendTrigger.io.csrTriggerEnable := io.csrTriggerEnable
 
   val f3_triggered = frontendTrigger.io.triggered
 
@@ -676,19 +785,19 @@ class NewIFU(implicit p: Parameters) extends XSModule
     */
 
   val wb_valid          = RegNext(RegNext(f2_fire && !f2_flush) && !f3_req_is_mmio && !f3_flush)
-  val wb_ftq_req        = RegEnable(f3_ftq_req, enable = RegNext(f2_fire && !f2_flush) && !f3_req_is_mmio && !f3_flush)
+  val wb_ftq_req        = RegNext(f3_ftq_req)
 
-  val wb_check_result_stage1   = RegEnable(checkerOutStage1, enable = RegNext(f2_fire && !f2_flush) && !f3_req_is_mmio && !f3_flush)
+  val wb_check_result_stage1   = RegNext(checkerOutStage1)
   val wb_check_result_stage2   = checkerOutStage2
-  val wb_instr_range    = RegEnable(io.toIbuffer.bits.enqEnable, enable = RegNext(f2_fire && !f2_flush) && !f3_req_is_mmio && !f3_flush)
-  val wb_pc             = RegEnable(f3_pc, enable = RegNext(f2_fire && !f2_flush) && !f3_req_is_mmio && !f3_flush)
-  val wb_pd             = RegEnable(f3_pd, enable = RegNext(f2_fire && !f2_flush) && !f3_req_is_mmio && !f3_flush)
-  val wb_instr_valid    = RegEnable(f3_instr_valid, enable = RegNext(f2_fire && !f2_flush) && !f3_req_is_mmio && !f3_flush)
+  val wb_instr_range    = RegNext(io.toIbuffer.bits.enqEnable)
+  val wb_pc             = RegNext(f3_pc)
+  val wb_pd             = RegNext(f3_pd)
+  val wb_instr_valid    = RegNext(f3_instr_valid)
 
   /* false hit lastHalf */
-  val wb_lastIdx        = RegEnable(f3_last_validIdx, enable = RegNext(f2_fire && !f2_flush) && !f3_req_is_mmio && !f3_flush)
-  val wb_false_lastHalf = RegEnable(f3_false_lastHalf, enable = RegNext(f2_fire && !f2_flush) && !f3_req_is_mmio && !f3_flush) && wb_lastIdx =/= (PredictWidth - 1).U
-  val wb_false_target   = RegEnable(f3_false_snpc, enable = RegNext(f2_fire && !f2_flush) && !f3_req_is_mmio && !f3_flush)
+  val wb_lastIdx        = RegNext(f3_last_validIdx)
+  val wb_false_lastHalf = RegNext(f3_false_lastHalf) && wb_lastIdx =/= (PredictWidth - 1).U
+  val wb_false_target   = RegNext(f3_false_snpc)
 
   val wb_half_flush = wb_false_lastHalf
   val wb_half_target = wb_false_target
@@ -718,21 +827,21 @@ class NewIFU(implicit p: Parameters) extends XSModule
   }
 
   val checkFlushWb = Wire(Valid(new PredecodeWritebackBundle))
+  val checkFlushWbjalTargetIdx = ParallelPriorityEncoder(VecInit(wb_pd.zip(wb_instr_valid).map{case (pd, v) => v && pd.isJal }))
+  val checkFlushWbTargetIdx = ParallelPriorityEncoder(wb_check_result_stage2.fixedMissPred)
   checkFlushWb.valid                  := wb_valid
-  // when(wb_valid){
-    checkFlushWb.bits.pc                := wb_pc
-    checkFlushWb.bits.pd                := wb_pd
-    checkFlushWb.bits.pd.zipWithIndex.map{case(instr,i) => instr.valid := wb_instr_valid(i)}
-    checkFlushWb.bits.ftqIdx            := wb_ftq_req.ftqIdx
-    checkFlushWb.bits.ftqOffset         := wb_ftq_req.ftqOffset.bits
-    checkFlushWb.bits.misOffset.valid   := ParallelOR(wb_check_result_stage2.fixedMissPred) || wb_half_flush
-    checkFlushWb.bits.misOffset.bits    := Mux(wb_half_flush, wb_lastIdx, ParallelPriorityEncoder(wb_check_result_stage2.fixedMissPred))
-    checkFlushWb.bits.cfiOffset.valid   := ParallelOR(wb_check_result_stage1.fixedTaken)
-    checkFlushWb.bits.cfiOffset.bits    := ParallelPriorityEncoder(wb_check_result_stage1.fixedTaken)
-    checkFlushWb.bits.target            := Mux(wb_half_flush, wb_half_target, wb_check_result_stage2.fixedTarget(ParallelPriorityEncoder(wb_check_result_stage2.fixedMissPred)))
-    checkFlushWb.bits.jalTarget         := wb_check_result_stage2.fixedTarget(ParallelPriorityEncoder(VecInit(wb_pd.zip(wb_instr_valid).map{case (pd, v) => v && pd.isJal })))
-    checkFlushWb.bits.instrRange        := wb_instr_range.asTypeOf(Vec(PredictWidth, Bool()))
-  // }
+  checkFlushWb.bits.pc                := wb_pc
+  checkFlushWb.bits.pd                := wb_pd
+  checkFlushWb.bits.pd.zipWithIndex.map{case(instr,i) => instr.valid := wb_instr_valid(i)}
+  checkFlushWb.bits.ftqIdx            := wb_ftq_req.ftqIdx
+  checkFlushWb.bits.ftqOffset         := wb_ftq_req.ftqOffset.bits
+  checkFlushWb.bits.misOffset.valid   := ParallelOR(wb_check_result_stage2.fixedMissPred) || wb_half_flush
+  checkFlushWb.bits.misOffset.bits    := Mux(wb_half_flush, wb_lastIdx, ParallelPriorityEncoder(wb_check_result_stage2.fixedMissPred))
+  checkFlushWb.bits.cfiOffset.valid   := ParallelOR(wb_check_result_stage1.fixedTaken)
+  checkFlushWb.bits.cfiOffset.bits    := ParallelPriorityEncoder(wb_check_result_stage1.fixedTaken)
+  checkFlushWb.bits.target            := Mux(wb_half_flush, wb_half_target, wb_check_result_stage2.fixedTarget(checkFlushWbTargetIdx))
+  checkFlushWb.bits.jalTarget         := wb_check_result_stage2.fixedTarget(checkFlushWbjalTargetIdx)
+  checkFlushWb.bits.instrRange        := wb_instr_range.asTypeOf(Vec(PredictWidth, Bool()))
 
   toFtq.pdWb := Mux(wb_valid, checkFlushWb,  mmioFlushWb)
 
@@ -758,8 +867,9 @@ class NewIFU(implicit p: Parameters) extends XSModule
         wb_ftq_req.startAddr, wb_ftq_req.nextStartAddr, wb_ftq_req.ftqOffset.valid, wb_ftq_req.ftqOffset.bits)
   }
 
+
   /** performance counter */
-  val f3_perf_info     = RegEnable(next = f2_perf_info, enable = f2_fire)
+  val f3_perf_info     = RegEnable(f2_perf_info,  f2_fire)
   val f3_req_0    = io.toIbuffer.fire()
   val f3_req_1    = io.toIbuffer.fire() && f3_doubleLine
   val f3_hit_0    = io.toIbuffer.fire() && f3_perf_info.bank_hit(0)
@@ -798,5 +908,42 @@ class NewIFU(implicit p: Parameters) extends XSModule
   XSPerfAccumulate("hit_0_except_1",   f3_perf_info.hit_0_except_1 && io.toIbuffer.fire() )
   XSPerfAccumulate("miss_0_except_1",   f3_perf_info.miss_0_except_1 && io.toIbuffer.fire() )
   XSPerfAccumulate("except_0",   f3_perf_info.except_0 && io.toIbuffer.fire() )
-}
+  XSPerfHistogram("ifu2ibuffer_validCnt", PopCount(io.toIbuffer.bits.valid & io.toIbuffer.bits.enqEnable), io.toIbuffer.fire, 0, PredictWidth + 1, 1)
 
+  val isWriteFetchToIBufferTable = WireInit(Constantin.createRecord("isWriteFetchToIBufferTable" + p(XSCoreParamsKey).HartId.toString))
+  val isWriteIfuWbToFtqTable = WireInit(Constantin.createRecord("isWriteIfuWbToFtqTable" + p(XSCoreParamsKey).HartId.toString))
+  val fetchToIBufferTable = ChiselDB.createTable("FetchToIBuffer" + p(XSCoreParamsKey).HartId.toString, new FetchToIBufferDB)
+  val ifuWbToFtqTable = ChiselDB.createTable("IfuWbToFtq" + p(XSCoreParamsKey).HartId.toString, new IfuWbToFtqDB)
+
+  val fetchIBufferDumpData = Wire(new FetchToIBufferDB)
+  fetchIBufferDumpData.start_addr := f3_ftq_req.startAddr
+  fetchIBufferDumpData.instr_count := PopCount(io.toIbuffer.bits.enqEnable)
+  fetchIBufferDumpData.exception := (f3_perf_info.except_0 && io.toIbuffer.fire()) || (f3_perf_info.hit_0_except_1 && io.toIbuffer.fire()) || (f3_perf_info.miss_0_except_1 && io.toIbuffer.fire())
+  fetchIBufferDumpData.is_cache_hit := f3_hit
+
+  val ifuWbToFtqDumpData = Wire(new IfuWbToFtqDB)
+  ifuWbToFtqDumpData.start_addr := wb_ftq_req.startAddr
+  ifuWbToFtqDumpData.is_miss_pred := checkFlushWb.bits.misOffset.valid
+  ifuWbToFtqDumpData.miss_pred_offset := checkFlushWb.bits.misOffset.bits
+  ifuWbToFtqDumpData.checkJalFault := checkJalFault
+  ifuWbToFtqDumpData.checkRetFault := checkRetFault
+  ifuWbToFtqDumpData.checkTargetFault := checkTargetFault
+  ifuWbToFtqDumpData.checkNotCFIFault := checkNotCFIFault
+  ifuWbToFtqDumpData.checkInvalidTaken := checkInvalidTaken
+
+  fetchToIBufferTable.log(
+    data = fetchIBufferDumpData,
+    en = isWriteFetchToIBufferTable.orR && io.toIbuffer.fire,
+    site = "IFU" + p(XSCoreParamsKey).HartId.toString,
+    clock = clock,
+    reset = reset
+  )
+  ifuWbToFtqTable.log(
+    data = ifuWbToFtqDumpData,
+    en = isWriteIfuWbToFtqTable.orR && checkFlushWb.valid,
+    site = "IFU" + p(XSCoreParamsKey).HartId.toString,
+    clock = clock,
+    reset = reset
+  )
+
+}
